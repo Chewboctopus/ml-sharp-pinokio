@@ -36,7 +36,9 @@ A seamless Pinokio-ready Web UI for **Apple's ML-Sharp**, allowing you to genera
 
 - **Pinokio**: [https://pinokio.computer](https://pinokio.computer)
 - **Apple Silicon (Mac)**: Highly recommended and extremely fast for 3D generation using MPS.
+    - **Requirement**: Minimum **16GB Unified Memory** is required for stable operation.
 - **NVIDIA GPU**: Required for the optional video rendering (CUDA), also provides high-speed generation.
+    - **Performance Note**: Typical usage requires approximately **9GB VRAM**. A GPU with **10GB+** is recommended for best performance. Smaller VRAM capacities are supported via virtual memory/shared RAM (slower).
 - **CPU / Other GPUs**: Supported via a generic installation path (performance may vary).
 - **Windows/Linux/Mac**: Fully cross-platform.
 
