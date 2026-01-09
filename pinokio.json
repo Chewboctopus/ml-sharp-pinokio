@@ -30,6 +30,23 @@
                 {
                     "title": "ML-Sharp Repository",
                     "value": "https://github.com/apple/ml-sharp"
+                },
+                {
+                    "title": "gsplat Repository",
+                    "value": "https://github.com/nerfstudio-project/gsplat"
+                }
+            ]
+        },
+        {
+            "title": "Support the Project",
+            "links": [
+                {
+                    "title": "GitHub Sponsor",
+                    "value": "https://github.com/sponsors/francescofugazzi"
+                },
+                {
+                    "title": "Buy Me A Coffee",
+                    "value": "https://www.buymeacoffee.com/franzipol"
                 }
             ]
         }

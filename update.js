@@ -40,9 +40,25 @@ module.exports = {
                 ]
             }
         },
-        // UPDATE (Non-Windows/Linux NVIDIA OR Windows/Linux without NVIDIA)
+        // UPDATE MAC ARM (darwin)
         {
-            when: "{{(platform !== 'win32' && platform !== 'linux') || (platform === 'win32' && gpu !== 'nvidia')}}",
+            when: "{{platform === 'darwin'}}",
+            method: "shell.run",
+            params: {
+                path: "app/ml-sharp",
+                conda: { path: "../env", python: "3.11" },
+                message: [
+                    "pip install uv",
+                    "uv pip install ../wheels/gsplat-1.5.3-cp311-cp311-macosx_11_0_arm64.whl --no-deps",
+                    "uv pip install -r requirements.txt",
+                    "uv pip install gradio",
+                    "uv pip install ."
+                ]
+            }
+        },
+        // UPDATE (Fallback: Windows without NVIDIA or other unsupported platforms)
+        {
+            when: "{{(platform !== 'win32' && platform !== 'linux' && platform !== 'darwin') || (platform === 'win32' && gpu !== 'nvidia')}}",
             method: "shell.run",
             params: {
                 path: "app/ml-sharp",

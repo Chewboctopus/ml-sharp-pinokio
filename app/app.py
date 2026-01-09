@@ -1,4 +1,8 @@
+import logging
+logging.basicConfig(level=logging.INFO)
+print("--- WebUI for ML-Sharp Starting ---")
 import gradio as gr
+print("Gradio imported.")
 import subprocess
 import os
 import shutil
@@ -6,8 +10,17 @@ import time
 import datetime
 import glob
 import sys
-import torch # Only for Cuda check
+import torch # Only for Device check
+device_type = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+print(f"Torch version: {torch.__version__} (Device: {device_type.upper()})")
 import json
+from pathlib import Path
+print("Loading Engine...")
+from sharp_engine import MLSharpEngine
+
+# Initialize Engine
+engine = MLSharpEngine()
+print("Engine Initialized.")
 
 # --- PATHS ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -95,12 +108,6 @@ def convert_ply_for_gradio(input_path: str, output_path: str = None) -> str:
         base, ext = os.path.splitext(input_path)
         output_path = f"{base}_gradio{ext}"
     
-    # If converted file already exists and is newer, use it
-    if os.path.exists(output_path):
-        if os.path.getmtime(output_path) >= os.path.getmtime(input_path):
-            print(f"DEBUG: Using cached converted PLY: {output_path}")
-            return output_path
-    
     try:
         print(f"DEBUG: Converting PLY for Gradio: {input_path}")
         plydata = PlyData.read(input_path)
@@ -128,13 +135,55 @@ def convert_ply_for_gradio(input_path: str, output_path: str = None) -> str:
     except Exception as e:
         print(f"DEBUG: PLY conversion failed: {e}")
         return input_path
-
 # --- HELPERS ---
 
+def run_command_generator(command, cwd=None, env=None):
+    """
+    Generator that runs a shell command and yields output lines in real-time.
+    """
+    print(f"DEBUG: Executing: {command}")
+    
+    # Merge env with system env
+    full_env = os.environ.copy()
+    if env:
+        full_env.update(env)
+        
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, # Merge stderr into stdout
+        shell=True,
+        text=True,
+        cwd=cwd,
+        env=full_env,
+        bufsize=1, # Line buffered
+        universal_newlines=True,
+        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    )
+    
+    # Yield output line by line
+    for line in process.stdout:
+        yield line.strip()
+        
+    process.wait()
+    if process.returncode != 0:
+        yield f"DEBUG: Process failed with code {process.returncode}"
+        raise subprocess.CalledProcessError(process.returncode, command)
+
+
 def check_cuda():
-    avail = torch.cuda.is_available()
-    print(f"DEBUG: CUDA Available? {avail}")
-    return avail
+    """Legacy name kept for compatibility - actually checks gsplat availability."""
+    return check_gsplat()
+
+def check_gsplat():
+    """Check if gsplat is installed (enables video rendering on CUDA or MPS)."""
+    try:
+        import gsplat
+        # print(f"DEBUG: gsplat found, version: {getattr(gsplat, '__version__', 'unknown')}")
+        return True
+    except ImportError:
+        print("DEBUG: gsplat NOT installed - video rendering disabled")
+        return False
 
 def load_config():
     print(f"DEBUG: Loading config from {CONFIG_FILE}")
@@ -151,15 +200,28 @@ def load_config():
         return {}
 
 def save_config(key, value):
+    # Ensure at least one trajectory if we are saving that key
+    if key == "trajectory_type" and (not value or len(value) == 0):
+        print("DEBUG: Ignoring attempt to save empty trajectory list.")
+        return
+
     print(f"DEBUG: Saving config {key}={value}")
-    cfg = load_config()
-    cfg[key] = value
-    try:
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(cfg, f)
-        print("DEBUG: Config saved successfully.")
-    except Exception as e:
-        print(f"DEBUG: Error saving config: {e}")
+    
+    # Simple retry mechanism for concurrent access
+    for i in range(5):
+        try:
+            cfg = load_config()
+            cfg[key] = value
+            # Write to a temporary file first for atomicity
+            temp_cfg = CONFIG_FILE + ".tmp"
+            with open(temp_cfg, "w") as f:
+                json.dump(cfg, f, indent=4)
+            os.replace(temp_cfg, CONFIG_FILE)
+            print("DEBUG: Config saved successfully.")
+            break
+        except Exception as e:
+            print(f"DEBUG: Save config attempt {i+1} failed: {e}")
+            time.sleep(0.1)
 
 def save_metadata(job_dir, data):
     meta_path = os.path.join(job_dir, "job_info.json")
@@ -267,107 +329,292 @@ def get_input_library_items():
     """Dummy function to prevent NameError if still referenced."""
     return []
 
-def predict(image_path, do_render_video):
-    if not image_path: return "Error: No image uploaded.", gr.update()
-    
-    ts = int(time.time())
-    original_name = os.path.basename(image_path)
-    safe_name, ext = os.path.splitext(original_name)
-    
-    # 2. Create Job Folder
-    job_name = f"{safe_name}_{ts}"
-    job_dir = os.path.join(OUTPUTS_DIR, job_name)
-    os.makedirs(job_dir, exist_ok=True)
-    
-    # 3. Save Input in Job (as reference and thumbnail)
-    job_input = os.path.join(job_dir, f"input_source{ext}")
-    shutil.copy(image_path, job_input)
-    
-    # 4. Execute Sharp Predict
-    # Use temp dir for command input? or direct? Direct is better
-    print(f"START JOB: {job_name}")
-    
-    cmd = [SHARP_EXE, "predict", "-i", job_input, "-o", job_dir]
-    
-    # Save Initial Metadata
-    meta = {
-        "job_name": job_name,
-        "original_name": original_name,
-        "timestamp": ts,
-        "date": datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S'),
-        "status": "processing"
-    }
-    save_metadata(job_dir, meta)
-    
-    # Flag --render if requested (and if we have cuda)
-    if do_render_video and check_cuda():
-        cmd.append("--render")
-        # Note: device is set automatically
-    elif do_render_video and not check_cuda():
-        print("WARNING: Video requested but CUDA not available. Ignoring --render.")
+# --- THREADED EXECUTION WRAPPER ---
+import threading
+import queue
 
-    try:
-        subprocess.run(cmd, check=True)
-        
-        # Check for generated videos
-        # Patterns: input_source.mp4 (Color), input_source_depth.mp4 (Depth)
-        # Or typical sharp output might vary. Let's look for both.
-        
-        vid_color = None
-        vid_depth = None
-        
-        # Color
-        c_canc = glob.glob(os.path.join(job_dir, "*input_source.mp4"))
-        if c_canc: vid_color = c_canc[0]
-        
-        # Depth
-        d_canc = glob.glob(os.path.join(job_dir, "*depth.mp4"))
-        if d_canc: vid_depth = d_canc[0]
-            
-        if d_canc: vid_depth = d_canc[0]
-        
-        # Update Metadata
-        meta["status"] = "completed"
-        save_metadata(job_dir, meta)
-            
-        return f"Completed: {job_name}", gr.update(value=get_history_list()), vid_color, vid_depth, job_dir
-    except subprocess.CalledProcessError as e:
-        return f"CLI Error: {e}", gr.update(value=get_history_list()), None, None, None
-    except Exception as e:
-        return f"Generic Error: {e}", gr.update(value=get_history_list()), None, None, None
+class QueuedLoggingHandler(logging.Handler):
+    def __init__(self, log_queue):
+        super().__init__()
+        self.log_queue = log_queue
 
-def render_video_for_job(job_name):
-    if not job_name: return "No job selected", None, None
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            self.log_queue.put(msg)
+        except Exception:
+            self.handleError(record)
+
+def predict(image_path, do_render_video, traj_config=None, num_steps=60, low_vram=False, f_mm=None, progress=gr.Progress()):
+    if not image_path: 
+        yield ("error", "Error: No image uploaded.")
+        return
+
+    # Queue for logs
+    log_queue = queue.Queue()
+    handler = QueuedLoggingHandler(log_queue)
+    formatter = logging.Formatter('%(message)s')
+    handler.setFormatter(formatter)
     
-    job_dir = os.path.join(OUTPUTS_DIR, job_name)
-    # Find PLY
-    plys = glob.glob(os.path.join(job_dir, "*.ply"))
-    if not plys: return "No PLY file found in this job.", None
+    root_logger = logging.getLogger()
+    root_logger.addHandler(handler)
+    root_logger.setLevel(logging.INFO)
     
-    ply_path = plys[0]
+    result_container = {}
     
-    if not check_cuda():
-        return "Error: Video rendering requires CUDA (NVIDIA GPU).", None, None
-        
-    cmd = [SHARP_EXE, "render", "-i", ply_path, "-o", job_dir]
-    try:
-        subprocess.run(cmd, check=True)
-        # Find generated video
-        vid_color = None
-        vid_depth = None
-        
-        # Color
-        c_canc = glob.glob(os.path.join(job_dir, "*input_source.mp4"))
-        if c_canc: vid_color = c_canc[0]
-        
-        # Depth
-        d_canc = glob.glob(os.path.join(job_dir, "*depth.mp4"))
-        if d_canc: vid_depth = d_canc[0]
+    def target():
+        try:
+            ts = int(time.time())
+            original_name = os.path.basename(image_path)
+            safe_name, ext = os.path.splitext(original_name)
             
-        return "Video(s) Rendered!", vid_color, vid_depth
+            job_name = f"{safe_name}_{ts}"
+            job_dir = os.path.join(OUTPUTS_DIR, job_name)
+            os.makedirs(job_dir, exist_ok=True)
+            
+            job_input = os.path.join(job_dir, f"input_source{ext}")
+            shutil.copy(image_path, job_input)
+            
+            print(f"START JOB (Engine): {job_name}")
+            
+            meta = {
+                "job_name": job_name,
+                "original_name": original_name,
+                "timestamp": ts,
+                "date": datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S'),
+                "status": "processing"
+            }
+            save_metadata(job_dir, meta)
+            
+            lv = low_vram
+            if lv is None:
+                config = load_config()
+                lv = config.get("low_vram", False)
+            
+            resolution = 1536
+            
+            checkpoint_path = os.path.join(BASE_DIR, "app", "ml-sharp", "sharp_2572gikvuh.pt")
+            if not os.path.exists(checkpoint_path):
+                 checkpoint_path = os.path.join(BASE_DIR, "sharp_2572gikvuh.pt")
+            
+            if not os.path.exists(checkpoint_path):
+                checkpoint_path = None
+            else:
+                checkpoint_path = Path(checkpoint_path)
+
+            engine.load_model(checkpoint_path, low_vram=lv)
+            # Predict
+            ply_output_path = os.path.join(job_dir, f"input_source.ply")
+            gaussians, f_px, res_px = engine.predict(job_input, ply_output_path, internal_resolution=resolution, f_mm_override=f_mm)
+            
+            # NOTIFY PLY READY
+            log_queue.put(("ply_ready", (ply_output_path, f_px, res_px)))
+            
+            vid_color = None
+            vid_depth = None
+            
+            if do_render_video and check_cuda():
+                local_traj_config = traj_config
+                if not local_traj_config:
+                     local_traj_config = {"rotate_forward": {"enabled": True, "depth": True}}
+                
+                enabled_trajs = [(k, v["depth"]) for k, v in local_traj_config.items() if v.get("enabled", False)]
+                if not enabled_trajs:
+                     enabled_trajs = [("rotate_forward", True)]
+                
+                vid_color_path = os.path.join(job_dir, "input_source.mp4")
+                rendered_videos = [] 
+                
+                print(f"Engine: Rendering {len(enabled_trajs)} trajectories...")
+                for traj_type, do_depth in enabled_trajs:
+                    log_queue.put(("rendering", (traj_type, do_depth)))
+                    print(f"Engine: Rendering {traj_type} - Depth: {do_depth}...")
+                    vc, vd = engine.render_video(gaussians, f_px, res_px, vid_color_path, 
+                                                 trajectory_type=traj_type, num_steps=num_steps, render_depth=do_depth)
+                    vid_color = vc
+                    vid_depth = vd
+                    rendered_videos.append(traj_type)
+                    
+                    # Yield incremental video result
+                    log_queue.put(("video_ready", (traj_type, vc, vd)))
+                    
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                
+                meta["rendered_trajectories"] = rendered_videos
+                save_metadata(job_dir, meta)
+            
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+            meta["status"] = "completed"
+            save_metadata(job_dir, meta)
+            
+            result_container['success'] = True
+            result_container['data'] = (f"Completed: {job_name}", None, vid_color, vid_depth, job_dir)
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            result_container['success'] = False
+            result_container['error'] = str(e)
+            
+    t = threading.Thread(target=target)
+    t.start()
+    
+    current_log = ""
+    while t.is_alive():
+        try:
+            # Non-blocking get
+            raw_msg = log_queue.get_nowait()
+            
+            # Check if it's a special event
+            if isinstance(raw_msg, tuple):
+                event_type, event_data = raw_msg
+                yield (event_type, event_data)
+            else:
+                msg = raw_msg
+                current_log += msg + "\n"
+                yield ("log", current_log)
+                
+        except queue.Empty:
+            time.sleep(0.1)
+            
+    while not log_queue.empty():
+        raw_msg = log_queue.get()
+        if isinstance(raw_msg, tuple):
+             event_type, event_data = raw_msg
+             yield (event_type, event_data)
+        else:
+             msg = raw_msg
+             current_log += msg + "\n"
+             
+    root_logger.removeHandler(handler)
+    
+    if result_container.get("success"):
+        yield ("done", (current_log, result_container['data']))
+    else:
+        err = result_container.get("error", "Unknown Error")
+        yield ("error", current_log + "\nError: " + err)
+
+def render_video_gen(job_name, traj_config=None, num_steps=60, low_vram=False):
+    if not job_name: 
+        yield ("error", "No job selected")
+        return
+
+    log_queue = queue.Queue()
+    handler = QueuedLoggingHandler(log_queue)
+    formatter = logging.Formatter('%(message)s')
+    handler.setFormatter(formatter)
+    
+    root_logger = logging.getLogger()
+    root_logger.addHandler(handler)
+    root_logger.setLevel(logging.INFO)
+    
+    result_container = {}
+    
+    def target():
+        try:
+            job_dir = os.path.join(OUTPUTS_DIR, job_name)
+            plys = glob.glob(os.path.join(job_dir, "*.ply"))
+            if not plys: 
+                result_container['success'] = False
+                result_container['error'] = "No PLY file found in this job."
+                return
+            
+            ply_path = plys[0]
+            
+            if not check_gsplat():
+                result_container['success'] = False
+                result_container['error'] = "Video rendering requires gsplat (CUDA/MPS)."
+                return
+
+            checkpoint_path = os.path.join(BASE_DIR, "app", "ml-sharp", "sharp_2572gikvuh.pt")
+            if not os.path.exists(checkpoint_path):
+                 checkpoint_path = os.path.join(BASE_DIR, "sharp_2572gikvuh.pt")
+            
+            if not os.path.exists(checkpoint_path):
+                checkpoint_path = None
+            else:
+                checkpoint_path = Path(checkpoint_path)
+                
+            engine.load_model(checkpoint_path, low_vram=low_vram)
+            
+            gaussians, metadata = engine.load_gaussians(ply_path)
+            
+            local_traj_config = traj_config
+            if not local_traj_config:
+                 local_traj_config = {"rotate_forward": {"enabled": True, "depth": True}}
+            
+            enabled_trajs = [(k, v["depth"]) for k, v in local_traj_config.items() if v.get("enabled", False)]
+            if not enabled_trajs:
+                 enabled_trajs = [("rotate_forward", True)]
+                
+            vid_color_path = os.path.join(job_dir, f"{Path(ply_path).stem}.mp4")
+            
+            last_vc, last_vd = None, None
+            rendered_videos = []
+            
+            print(f"Engine (Regen): Rendering {len(enabled_trajs)} trajectories...")
+            for traj_type, do_depth in enabled_trajs:
+                print(f"Engine (Regen): Rendering {traj_type} ({num_steps} steps) - Depth: {do_depth}...")
+                vc, vd = engine.render_video(gaussians, metadata.focal_length_px, metadata.resolution_px, 
+                                            vid_color_path, trajectory_type=traj_type, num_steps=num_steps, render_depth=do_depth)
+                last_vc, last_vd = vc, vd
+                rendered_videos.append(traj_type)
+                
+                # Notify about completed video immediately
+                log_queue.put(("video_ready", (traj_type, vc, vd)))
+                
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            meta = load_metadata(job_dir)
+            meta["rendered_trajectories"] = rendered_videos
+            save_metadata(job_dir, meta)
+
+            result_container['success'] = True
+            result_container['data'] = ("Video(s) Rendered!", last_vc, last_vd)
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            result_container['success'] = False
+            result_container['error'] = str(e)
+
+    t = threading.Thread(target=target)
+    t.start()
+    
+    current_log = ""
+    while t.is_alive():
+        try:
+            raw_msg = log_queue.get_nowait()
+            
+            # Check if it's a special event (tuple) or plain log string
+            if isinstance(raw_msg, tuple):
+                event_type, event_data = raw_msg
+                yield (event_type, event_data)
+            else:
+                current_log += raw_msg + "\n"
+                yield ("log", current_log)
+        except queue.Empty:
+            time.sleep(0.1)
+            
+    while not log_queue.empty():
+        raw_msg = log_queue.get()
+        if isinstance(raw_msg, tuple):
+            event_type, event_data = raw_msg
+            yield (event_type, event_data)
+        else:
+            current_log += raw_msg + "\n"
         
-    except Exception as e:
-        return f"Render Error: {e}", None, None
+    root_logger.removeHandler(handler)
+    
+    if result_container.get("success"):
+        yield ("done", (current_log, result_container['data']))
+    else:
+        err = result_container.get("error", "Unknown Error")
+        yield ("error", current_log + "\nError: " + err)
 
 def load_job_details(evt: gr.SelectData):
     # evt.value is the caption if gallery mode is caption. But here we pass tuples (img, label)
@@ -476,9 +723,9 @@ def zip_job(job_name):
     
     try:
         # Yield 1: Processing
-        # [lbl, img, model3d, files, vc, vd, log, zip_out, ply_btn, vid_btn, make_zip_btn, del_btn, run_btn]
+        # [lbl, img, model3d, selector, files, vc, vd, log, zip_out, ply_btn, vid_btn, make_zip_btn, del_btn, run_btn]
         yield (
-            gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(),
+            gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(),
             running_tasks[job_name], 
             gr.update(visible=False), 
             gr.update(interactive=False), gr.update(interactive=False), # Lock other actions
@@ -498,9 +745,9 @@ def zip_job(job_name):
         # Get standard refresh state
         fresh_state = list(load_job_details_by_name(job_name))
         
-        # Override zip output (index 7 now)
-        fresh_state[7] = gr.update(value=full_path, visible=True, label=f"Download {os.path.basename(full_path)}")
-        fresh_state[6] = "ZIP Created Successfully"
+        # Override zip output (index 8)
+        fresh_state[8] = gr.update(value=full_path, visible=True, label=f"Download {os.path.basename(full_path)}")
+        fresh_state[7] = "ZIP Created Successfully"
         
         yield tuple(fresh_state)
         
@@ -509,11 +756,10 @@ def zip_job(job_name):
         if job_name in running_tasks: del running_tasks[job_name]
         yield return_error()
 
-def retry_job_ply(job_name):
-    # helper for return
+def retry_job_ply(job_name, low_vram, progress=gr.Progress()):
     def return_refresh(log_msg=""):
         res = list(load_job_details_by_name(job_name))
-        if log_msg: res[5] = log_msg
+        if log_msg: res[7] = log_msg
         return tuple(res)
         
     if not job_name: 
@@ -525,8 +771,6 @@ def retry_job_ply(job_name):
         return
 
     job_dir = os.path.join(OUTPUTS_DIR, job_name)
-    
-    # ... (input finding logic same) ...
     input_file = None
     candidates = glob.glob(os.path.join(job_dir, "*"))
     for f in candidates:
@@ -544,67 +788,187 @@ def retry_job_ply(job_name):
         yield return_refresh("Error: No valid input image found.")
         return
         
-    print(f"RETRY PLY JOB: {job_name} using {input_file}")
-    
-    # Set state
     running_tasks[job_name] = "Generating PLY..."
     
-    try:
-        # Yield 1: Processing
-        yield (
-            gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(),
-            running_tasks[job_name] + " (please wait)", 
-            gr.skip(), 
-            gr.update(interactive=False), # self (ply)
-            gr.update(interactive=False), # vid
-            gr.update(interactive=False), # zip
-            gr.update(interactive=False), # delete
-            gr.update(interactive=False)  # run
-        )
-        
-        cmd = [SHARP_EXE, "predict", "-i", input_file, "-o", job_dir]
-        subprocess.run(cmd, check=True)
-        
-        if job_name in running_tasks: del running_tasks[job_name]
-        yield return_refresh(f"PLY Generated for {job_name}")
-        
-    except Exception as e:
-        if job_name in running_tasks: del running_tasks[job_name]
-        yield return_refresh(f"Error generating PLY: {e}")
+    # Threaded Execution for PLY
+    log_queue = queue.Queue()
+    handler = QueuedLoggingHandler(log_queue)
+    formatter = logging.Formatter('%(message)s')
+    handler.setFormatter(formatter)
+    
+    root_logger = logging.getLogger()
+    root_logger.addHandler(handler)
+    root_logger.setLevel(logging.INFO)
+    
+    result_container = {}
 
-def regen_video_action(job_name):
-    if is_system_busy():
+    def target():
+        try:
+             # Load Model
+            checkpoint_path = os.path.join(BASE_DIR, "app", "ml-sharp", "sharp_2572gikvuh.pt")
+            if not os.path.exists(checkpoint_path):
+                 checkpoint_path = os.path.join(BASE_DIR, "sharp_2572gikvuh.pt")
+            
+            if not os.path.exists(checkpoint_path):
+                checkpoint_path = None
+            else:
+                checkpoint_path = Path(checkpoint_path)
+
+            engine.load_model(checkpoint_path, low_vram=low_vram)
+            
+            # Predict
+            ply_output_path = os.path.join(job_dir, "input_source.ply")
+            engine.predict(input_file, ply_output_path, internal_resolution=1536)
+            
+            result_container['success'] = True
+            
+        except Exception as e:
+            traceback.print_exc()
+            result_container['success'] = False
+            result_container['error'] = str(e)
+
+    t = threading.Thread(target=target)
+    t.start()
+    
+    # Initial Yield with marker for JS animation
+    yield (
+        gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(),
+        "[Generating] " + running_tasks[job_name] + " (Queued)...", 
+        gr.skip(), 
+        gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=False)
+    )
+
+    current_log = ""
+    while t.is_alive():
+        try:
+            msg = log_queue.get_nowait()
+            current_log += msg + "\n"
+            # Yield Log Update
+            res = list(load_job_details_by_name(job_name))
+            res[7] = current_log
+            if progress: progress(None, desc="Generating PLY...")
+            yield tuple(res)
+        except queue.Empty:
+            time.sleep(0.1)
+            
+    while not log_queue.empty():
+        msg = log_queue.get()
+        current_log += msg + "\n"
+        
+    root_logger.removeHandler(handler)
+    
+    if job_name in running_tasks: del running_tasks[job_name]
+    
+    if result_container.get("success"):
+        yield return_refresh(f"{current_log}\n[Done] PLY Generated Successfully!")
+    else:
+        yield return_refresh(f"{current_log}\n[Done] Error: {result_container.get('error')}")
+
+def regen_video_action(job_name, low_vram, seconds, *traj_args, progress=gr.Progress()):
+    def return_refresh(log_msg=""):
         res = list(load_job_details_by_name(job_name))
-        res[6] = get_busy_message()  # Index 6 is log now
-        yield tuple(res)
+        if log_msg: res[7] = log_msg
+        return tuple(res)
+        
+    if not job_name: 
+        yield return_refresh("No job selected")
         return
-
-    running_tasks[job_name] = "Rendering Video..."
+        
+    if is_system_busy():
+        yield return_refresh(get_busy_message())
+        return
+        
+    keys = ["rotate_forward", "rotate", "swipe", "shake", "dolly_in", "dolly_out", "dolly_in_out", "pan_left", "pan_right", "pan_left_right"]
+    traj_config = {}
+    for i, key in enumerate(keys):
+        traj_config[key] = {"enabled": traj_args[i*2], "depth": traj_args[i*2+1]}
+    
+    num_steps = seconds * 30
+    
+    running_tasks[job_name] = "Generating Video..."
+    
     try:
-        # Yield 1: Processing
-        yield (
-            gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(),
-            running_tasks[job_name] + " (This is heavy)", 
-            gr.skip(), 
-            gr.skip(), # ply
-            gr.update(interactive=False), # self (video)
-            gr.update(interactive=False), # zip
-            gr.update(interactive=False), # delete
-            gr.update(interactive=False)  # run
-        )
+         # Initial: Loading with marker for JS animation
+         yield (
+             gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(),
+             "[Rendering] Starting Video Render...", 
+             gr.skip(), 
+             gr.update(interactive=False), 
+             gr.update(interactive=False), 
+             gr.update(interactive=False), 
+             gr.update(interactive=False), 
+             gr.update(interactive=False)
+         )
+         
+         # Pre-populate with existing trajectories from job folder
+         job_dir = os.path.join(OUTPUTS_DIR, job_name)
+         existing_files = glob.glob(os.path.join(job_dir, "*.mp4"))
+         available_trajs = []
+         for f in existing_files:
+             fname = os.path.basename(f).lower()
+             if fname.startswith("input_source_") and fname.endswith(".mp4") and ".depth." not in fname:
+                 traj = fname.replace("input_source_", "").replace(".mp4", "")
+                 if traj and traj not in available_trajs:
+                     available_trajs.append(traj)
+         
+         last_vc = None
+         last_vd = None
+         
+         for status, payload in render_video_gen(job_name, traj_config, num_steps, low_vram):
+             if status == "log":
+                 res = list(load_job_details_by_name(job_name))
+                 # Only update log (index 7) with marker, preserve videos
+                 res[7] = "[Rendering] " + payload
+                 if last_vc: res[5] = last_vc
+                 if last_vd: res[6] = last_vd
+                 if available_trajs:
+                     res[3] = gr.update(choices=available_trajs, value=available_trajs[-1])
+                 if progress: progress(None, desc="Rendering Video...")
+                 yield tuple(res)
+             
+             elif status == "video_ready":
+                 traj, vc, vd = payload
+                 available_trajs.append(traj)
+                 last_vc = vc
+                 last_vd = vd
+                 
+                 res = list(load_job_details_by_name(job_name))
+                 res[3] = gr.update(choices=available_trajs, value=traj)
+                 res[5] = vc
+                 res[6] = vd
+                 res[7] = f"[Rendering] Rendered {traj}!"
+                 yield tuple(res)
+                 time.sleep(0.2)  # Give UI time to update
+                 
+             elif status == "done":
+                 final_log, data = payload
+                 msg, vc, vd = data
+                 
+                 # Clear task BEFORE final yield so buttons unlock
+                 if job_name in running_tasks: del running_tasks[job_name]
+                 
+                 res = list(load_job_details_by_name(job_name))
+                 res[7] = final_log + "\n[Done] " + msg
+                 if vc: res[5] = vc
+                 if vd: res[6] = vd
+                 
+                 job_dir = os.path.join(OUTPUTS_DIR, job_name)
+                 meta = load_metadata(job_dir)
+                 sel = meta.get("rendered_trajectories", [])
+                 res[3] = gr.update(choices=sel, value=sel[-1] if sel else None)
+                 
+                 yield tuple(res)
+                 return  # Exit early, task already cleared
+                 
+             elif status == "error":
+                 if job_name in running_tasks: del running_tasks[job_name]
+                 yield return_refresh(payload)
+                 return
 
-        msg, vc, vd = render_video_for_job(job_name)
-        
-        if job_name in running_tasks: del running_tasks[job_name]
-        
-        res = list(load_job_details_by_name(job_name))
-        res[6] = msg  # Index 6 is log
-        yield tuple(res)
     except Exception as e:
+        traceback.print_exc()
         if job_name in running_tasks: del running_tasks[job_name]
-        res = list(load_job_details_by_name(job_name))
-        res[6] = f"Error: {e}"  # Index 6 is log
-        yield tuple(res)
+        yield return_refresh(f"Error: {e}")
 
 def load_job_details_by_name(job_name):
     """Load job details by job name."""
@@ -625,12 +989,12 @@ def load_job_details_by_name(job_name):
     run_btn_upd = gr.update(interactive=True)
 
     if not job_name:
-         # lbl, img, model3d, files, vc, vd, log, zip_file, ply_btn, vid_btn, zip_btn, del_btn, run_btn
-        return "**No job selected**", None, None, None, None, None, "Select a job.", gr.update(visible=False), gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=False), run_btn_upd
+         # lbl, img, model3d, selector, files, vc, vd, log, zip_file, ply_btn, vid_btn, make_zip_btn, del_btn, run_btn
+        return "**No job selected**", None, None, gr.update(choices=[], value=None), None, None, None, "Select a job.", gr.update(visible=False), gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=False), run_btn_upd
     
     job_dir = os.path.join(OUTPUTS_DIR, job_name)
     if not os.path.exists(job_dir):
-        return f"**{job_name}** (not found)", None, None, None, None, None, "Job folder not found.", gr.update(visible=False), gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=False), run_btn_upd
+        return f"**{job_name}** (not found)", None, None, gr.update(choices=[], value=None), None, None, None, "Job folder not found.", gr.update(visible=False), gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=False), run_btn_upd
     
     # Find input image
     input_img = None
@@ -646,7 +1010,7 @@ def load_job_details_by_name(job_name):
                 break
     
     all_files = sorted(candidates)
-    has_ply = any(f.endswith(".ply") for f in all_files)
+    has_ply = any(f.lower().endswith(".ply") and "_gradio" not in f.lower() for f in all_files)
     
     # Find PLY file for 3D viewer
     ply_file = None
@@ -668,9 +1032,15 @@ def load_job_details_by_name(job_name):
         elif fname.endswith("depth.mp4"): vid_depth = f
     
     if not vid_color:
+        # Sort to prioritize certain names or just find any mp4
         for f in all_files:
-            if f.lower().endswith('.mp4') and 'depth' not in f.lower():
+            fname_lower = os.path.basename(f).lower()
+            if fname_lower.endswith('.mp4') and 'depth' not in fname_lower:
                 vid_color = f
+                # If we find a depth counterpart, set it
+                depth_cand = f.replace(".mp4", ".depth.mp4")
+                if os.path.exists(depth_cand):
+                    vid_depth = depth_cand
                 break
     
     vid_status = "Video available." if (vid_color or vid_depth) else "No video present."
@@ -681,6 +1051,7 @@ def load_job_details_by_name(job_name):
     # Lock logic overrides
     if lock_ui:
         ply_update = gr.update(interactive=False)
+        can_render = has_ply and check_cuda()
         vid_update = gr.update(interactive=False)
         zip_btn_upd = gr.update(interactive=False)
         del_btn_upd = gr.update(interactive=False)
@@ -695,57 +1066,55 @@ def load_job_details_by_name(job_name):
         run_btn_upd = gr.update(interactive=True)
         status_text = f"Status: {vid_status}"
     
+    # Extract selector list by scanning ACTUAL mp4 files (source of truth)
+    selector_choices = []
+    
+    # Scan for trajectory mp4 files: input_source_{trajectory}.mp4
+    for f in all_files:
+        fname = os.path.basename(f).lower()
+        if fname.startswith("input_source_") and fname.endswith(".mp4") and ".depth." not in fname:
+            # Extract trajectory name: input_source_rotate.mp4 -> rotate
+            traj = fname.replace("input_source_", "").replace(".mp4", "")
+            if traj and traj not in selector_choices:
+                selector_choices.append(traj)
+    
+    # Fallback for very old jobs with input_video.mp4 (no trajectories in filename)
+    if not selector_choices and vid_color:
+        fname = os.path.basename(vid_color).lower()
+        if "input_video" in fname:
+            # Very old format - just call it "video"
+            selector_choices = ["video"]
+        elif fname == "input_source.mp4":
+            # Another very old format
+            selector_choices = ["video"]
+        else:
+            # Try to extract trajectory name
+            name = fname.replace("input_source_", "").replace(".mp4", "")
+            if not name or name == "input_source": 
+                name = "video"
+            selector_choices = [name]
+
     return (
-        f"**{job_name}**",
-        input_img,
-        ply_file,  # For det_model_3d
-        all_files,
-        vid_color,
-        vid_depth,
-        status_text,
-        zip_file_update,
-        ply_update,
-        vid_update,
-        zip_btn_upd, # Btn Make Zip
-        del_btn_upd, # Btn Delete (Right)
-        run_btn_upd  # Btn Run (New Job)
+        f"**Job: {job_name}**",   # Label
+        input_img,               # Original Input
+        ply_file,                # 3D Viewer
+        gr.update(choices=selector_choices, value=selector_choices[-1] if selector_choices else None), # New selector
+        all_files,  # File links - all files, JS handles hiding delete buttons for protected files
+        vid_color,               # Video
+        vid_depth,               # Depth
+        status_text,             # Log
+        zip_file_update,         # ZIP Download box
+        ply_update,              # btn_gen_ply
+        vid_update,              # btn_gen_video
+        zip_btn_upd,             # btn_make_zip
+        del_btn_upd,             # btn_delete_job
+        run_btn_upd              # btn_run
     )
 
 # ...
 
 # Inside EVENTS ... 
-    # 4. Job Execution - also refresh the HTML list
-    def predict_and_refresh(image_path, do_render_video):
-        if is_system_busy():
-            return get_busy_message(), gr.update(), None, None
-        
-        result = predict(image_path, do_render_video)
-        log_msg = result[0]
-        vid_c = result[2] if len(result) > 2 else None
-        vid_d = result[3] if len(result) > 3 else None
-        job_dir = result[4] if len(result) > 4 else None
-        
-        # Gather Result Files (PLY and MP4s) for Tab 1
-        files_found = []
-        if job_dir and os.path.exists(job_dir):
-             raw_files = glob.glob(os.path.join(job_dir, "*.*"))
-             for f in raw_files:
-                 if f.lower().endswith(('.ply', '.mp4')):
-                     files_found.append(f)
-        else:
-             pass 
-        
-        # Fallback if no job_dir but we have video (rare)
-        if not files_found and vid_c:
-             job_dir_path = os.path.dirname(vid_c)
-             raw_files = glob.glob(os.path.join(job_dir_path, "*.*"))
-             for f in raw_files:
-                 if f.lower().endswith(('.ply', '.mp4')):
-                     files_found.append(f)
-
-        
-        new_html = generate_job_list_html()
-        return log_msg, new_html, vid_c, vid_d, files_found
+# Consolidating execution flow...
 
 
 # --- UI ---
@@ -772,8 +1141,15 @@ def load_assets():
 app_css, app_js = load_assets()
 
 with gr.Blocks(title="WebUI for ML-Sharp (3DGS)", delete_cache=(86400, 86400)) as demo:
+    # Load config once to reduce terminal spam and redundant I/O
+    global_cfg = load_config()
+    
     gr.Markdown("# WebUI for ML-Sharp (3DGS)")
     gr.HTML("<h3 style='text-align: center;'>Implementation of SHARP: Sharp Monocular View Synthesis in Less Than a Second</h3>")
+    
+    # Global Device Checks
+    has_gsplat = check_gsplat()
+    has_cuda = check_cuda() # Alias for compatibility
     
     with gr.Tabs(elem_id="main_tabs") as main_tabs:
         
@@ -782,41 +1158,140 @@ with gr.Blocks(title="WebUI for ML-Sharp (3DGS)", delete_cache=(86400, 86400)) a
             with gr.Row():
                 with gr.Column(scale=1):
                     new_input = gr.Image(label="Upload Image", type="filepath")
-                    has_cuda = check_cuda()
-                    # Load default preference, but force False if no CUDA
-                    default_render = load_config().get("render_video", False) and has_cuda
                     
-                    chk_render = gr.Checkbox(label="Generate Video Immediately (Requires CUDA)", value=default_render, interactive=has_cuda)
-                    if not has_cuda:
-                        gr.Markdown("*CUDA not detected: Video rendering disabled.*")
+                    # Low VRAM moved out and above
+                    low_vram_val = global_cfg.get("low_vram", False)
+                    chk_low_vram = gr.Checkbox(label="Low VRAM Mode (FP16) - Lower Precision (Recommended for < 8GB VRAM)", value=low_vram_val, interactive=True)
+                    
+                    sl_focal = gr.Slider(label="Focal Length (mm) - [Not Detected, Default: 30]", minimum=10, maximum=200, step=1, value=30)
+                    
+                    # Load default preference, but force False if no gsplat
+                    default_render = global_cfg.get("render_video", False) and has_gsplat
+                    chk_render = gr.Checkbox(label="Generate Video Immediately (Requires gsplat (CUDA/MPS))", value=default_render, interactive=has_gsplat)
+                    
+                    with gr.Accordion("Video Customization", open=True, visible=default_render) as video_acc:
+                        # (Removed internal resolution notice)
+                        gr.Markdown("### Trajectories & Depth")
+                        
+                        # Load trajectory preferences
+                        traj_pref = global_cfg.get("trajectory_config", {
+                            "rotate_forward": {"enabled": True, "depth": True},
+                            "rotate": {"enabled": False, "depth": True},
+                            "swipe": {"enabled": False, "depth": True},
+                            "shake": {"enabled": False, "depth": True},
+                            "dolly_in": {"enabled": False, "depth": True},
+                            "dolly_out": {"enabled": False, "depth": True},
+                            "dolly_in_out": {"enabled": False, "depth": True},
+                            "pan_left": {"enabled": False, "depth": True},
+                            "pan_right": {"enabled": False, "depth": True},
+                            "pan_left_right": {"enabled": False, "depth": True}
+                        })
+                        
+                        traj_controls = {}
+                        traj_order = [
+                            ("rotate_forward", "Rotate Forward"), ("rotate", "Full Rotate"), 
+                            ("swipe", "Swipe"), ("shake", "Shake"),
+                            ("dolly_in", "Dolly In"), ("dolly_out", "Dolly Out"), ("dolly_in_out", "Dolly In-Out"),
+                            ("pan_left", "Pan Left"), ("pan_right", "Pan Right"), ("pan_left_right", "Pan L-R")
+                        ]
+                        for key, label in traj_order:
+                            with gr.Row():
+                                pref = traj_pref.get(key, {})
+                                is_enabled = pref.get("enabled", False)
+                                # Force False for depth if not enabled, regardless of what's in config
+                                initial_depth = pref.get("depth", True) if is_enabled else False
+                                
+                                tc = gr.Checkbox(label=label, value=is_enabled, scale=3)
+                                td = gr.Checkbox(label="Depth", value=initial_depth, interactive=is_enabled, scale=1)
+                                traj_controls[key] = (tc, td)
+                        
+                        # Duration in seconds (1-6)
+                        steps_val = global_cfg.get("video_steps", 60)
+                        initial_seconds = max(1, min(6, steps_val // 30))
+                        sl_seconds = gr.Slider(label="Video Duration (seconds)", minimum=1, maximum=6, step=1, value=initial_seconds)
+                        
+                        # Link Interactivity & Values
+                        def update_depth_box(traj_enabled):
+                            return gr.update(interactive=traj_enabled, value=False if not traj_enabled else gr.skip())
+                        
+                        for key, (tc, td) in traj_controls.items():
+                            tc.change(fn=update_depth_box, inputs=[tc], outputs=[td])
+
+                    if not has_gsplat:
+                        gr.Markdown("*gsplat (CUDA/MPS) not detected: Video rendering disabled.*")
                     
                     # Save preference on change
-                    def on_render_change(val):
-                        save_config("render_video", val)
+                    chk_render.change(fn=lambda v: gr.update(visible=v), inputs=[chk_render], outputs=[video_acc])
+                    chk_render.change(fn=lambda v: save_config("render_video", v), inputs=[chk_render])
+                    chk_low_vram.change(fn=lambda v: save_config("low_vram", v), inputs=[chk_low_vram])
                     
-                    chk_render.change(fn=on_render_change, inputs=[chk_render], outputs=[])
+                    # Helper to save trajectory config
+                    def save_traj_config_ui(*args):
+                        # args will be [rf_c, rf_d, r_c, r_d, s_c, s_d, sh_c, sh_d]
+                        # We need to map them back
+                        keys = ["rotate_forward", "rotate", "swipe", "shake", "dolly_in", "dolly_out", "dolly_in_out", "pan_left", "pan_right", "pan_left_right"]
+                        new_cfg = {}
+                        for i, key in enumerate(keys):
+                            new_cfg[key] = {"enabled": args[i*2], "depth": args[i*2+1]}
+                        
+                        # Ensure at least one is enabled
+                        if not any(v["enabled"] for v in new_cfg.values()):
+                             # Revert or warn? For now we just save and handle in predict
+                             pass
+                        
+                        save_config("trajectory_config", new_cfg)
+
+                    # Wire up all trajectory checkboxes
+                    all_traj_inputs = []
+                    for key in ["rotate_forward", "rotate", "swipe", "shake", "dolly_in", "dolly_out", "dolly_in_out", "pan_left", "pan_right", "pan_left_right"]:
+                        all_traj_inputs.extend(list(traj_controls[key]))
                     
+                    for comp in all_traj_inputs:
+                        comp.change(fn=save_traj_config_ui, inputs=all_traj_inputs)
+
+                    # Map seconds to steps (30fps) for config
+                    sl_seconds.change(fn=lambda v: save_config("video_steps", v * 30), inputs=[sl_seconds])
                     
-                    btn_run = gr.Button("Start Generation", variant="primary")
-                    new_log = gr.Textbox(label="Execution Log")
+                    # Update Focal Length on image upload
+                    # Update Focal Length on image upload
+                    def update_focal_on_upload(img):
+                        if not img: return gr.update(value=30, label="Focal Length (mm) - [Not Detected, Default: 30]")
+                        f_mm = engine.get_image_focal(img)
+                        if f_mm:
+                             return gr.update(value=f_mm, label=f"Focal Length (mm) - [Detected: {f_mm:.1f}mm]")
+                        return gr.update(value=30, label="Focal Length (mm) - [Not Detected, Default: 30]")
+                    new_input.change(fn=update_focal_on_upload, inputs=[new_input], outputs=[sl_focal])
+                    
+                    btn_run = gr.Button("Start Generation", variant="primary", elem_id="btn_start_gen")
+                    new_log = gr.Textbox(label="Execution Log", lines=10, max_lines=20, autoscroll=True, elem_id="new_job_log")
 
                 with gr.Column(scale=2):
                     # 3D Model Viewer - Camera settings matching Apple ML-Sharp rotate_forward start
                     new_model_3d = gr.Model3D(
                         label="3D Gaussian Splat Preview",
                         height=500,
-                        camera_position=(0, 0, 1),  # Frontal view (alpha=0°, beta=0°, radius=2.5)
                         zoom_speed=0.5,
                         pan_speed=0.5,
-                        interactive=False
+                        interactive=False,
+                        elem_id="new_model_3d"
                     )
-                    
-                    # Result Files (PLY + MP4) - Download Only
-                    new_result_files = gr.File(label="Generated Files (3DGS PLY & Video)", file_count="multiple", interactive=False, elem_id="new_result_files_list")
+                    gr.HTML("""
+                        <div style="text-align: center; font-size: 0.9em; color: #888; margin-top: 5px;">
+                            For best results, download the .ply file and edit it in 
+                            <a href="https://superspl.at/editor" target="_blank" style="color: #4a90e2;">SuperSplat Editor</a>
+                        </div>
+                    """)
+                    gr.Markdown("*Note: The 3D viewer FOV is fixed and may not accurately reflect the chosen focal length. Refer to rendered videos for accurate perspective.*", elem_id="fov_notice_new")
                     
                     with gr.Row():
-                        new_vid_c = gr.Video(label="Video", interactive=False, loop=True, autoplay=True)
-                        new_vid_d = gr.Video(label="Depth Video", interactive=False, loop=True, autoplay=True)
+                        new_vid_c = gr.Video(label="Video", interactive=False, loop=True, autoplay=True, elem_id="new_vid_color")
+                        new_vid_d = gr.Video(label="Depth Video", interactive=False, loop=True, autoplay=True, elem_id="new_vid_depth")
+
+                    with gr.Row():
+                        drp_new_vid_selector = gr.Dropdown(label="Preview Video Trajectory", choices=[], interactive=True, scale=3, elem_id="new_vid_selector")
+                        # We don't need a button, change event will update
+                    
+                    new_result_files = gr.File(label="Generated Files", interactive=False, file_count="multiple", elem_id="new_result_files_list")
 
         # --- TAB 2: HISTORY ---
         with gr.Tab("Result History"):
@@ -835,68 +1310,142 @@ with gr.Blocks(title="WebUI for ML-Sharp (3DGS)", delete_cache=(86400, 86400)) a
                 
                 # RIGHT COLUMN: Selected Job Details
                 with gr.Column(scale=2):
-                    gr.Markdown("### Job Details")
                     selected_job_lbl = gr.Markdown("**No job selected**")
                     
+                    # Preview Section - small image, large 3D viewer
                     with gr.Row():
-                        det_img = gr.Image(label="Original Input", interactive=False, height=400)
+                        with gr.Column(scale=1):
+                            det_img = gr.Image(label="Original Input", interactive=False, height=200)
+                        with gr.Column(scale=3):
+                            det_model_3d = gr.Model3D(
+                                label="3D Gaussian Splat",
+                                height=400,
+                                zoom_speed=0.5,
+                                pan_speed=0.5,
+                                interactive=False,
+                                elem_id="det_model_3d"
+                            )
+                            gr.HTML("""
+                                <div style="text-align: center; font-size: 0.9em; color: #888; margin-top: 5px;">
+                                    For best results, download the .ply file and edit it in 
+                                    <a href="https://superspl.at/editor" target="_blank" style="color: #4a90e2;">SuperSplat Editor</a>
+                                </div>
+                            """)
                     
-                    # 3D Model Viewer for History - matching Apple ML-Sharp rotate_forward start
-                    det_model_3d = gr.Model3D(
-                        label="3D Gaussian Splat",
-                        height=400,
-                        camera_position=(0, 0, 2.5),  # Frontal view (alpha=0°, beta=0°, radius=2.5)
-                        zoom_speed=0.5,
-                        pan_speed=0.5,
-                        interactive=False
-                    )
+                    # Video Preview Accordion
+                    with gr.Accordion("📹 Video Preview", open=True):
+                        drp_det_vid_selector = gr.Dropdown(label="Trajectory", choices=[], interactive=True)
+                        with gr.Row():
+                            det_vid_c = gr.Video(label="Color", interactive=False, height=300, loop=True, autoplay=True, elem_id="det_vid_color")
+                            det_vid_d = gr.Video(label="Depth", interactive=False, height=300, loop=True, autoplay=True, elem_id="det_vid_depth")
                     
-                    with gr.Row():
-                        det_vid_c = gr.Video(label="Video", interactive=False, height=400, loop=True, autoplay=True)
-                        det_vid_d = gr.Video(label="Depth Video", interactive=False, height=400, loop=True, autoplay=True)
-                    
-                    # New Action Buttons Row
-                    with gr.Row():
-                        btn_make_zip = gr.Button("📦 Create ZIP Archive", variant="secondary", interactive=False)
-                        btn_gen_ply = gr.Button("⚙️ Generate 3DGS PLY", variant="primary", interactive=False)
-                        btn_gen_video = gr.Button("🎥 Generate Video", variant="secondary", interactive=False)
-                    
-                    # Zip Output File (Hidden initially)
-                    zip_output = gr.File(label="Download ZIP", interactive=False, visible=False)
+                    # Regeneration Options Accordion
+                    with gr.Accordion("⚙️ Regeneration Options", open=False):
+                        det_low_vram = gr.Checkbox(label="Low VRAM Mode (FP16) - Lower Precision (Recommended for < 8GB VRAM)", value=True, interactive=True)
+                        det_focal = gr.Slider(label="Focal Length (mm) - [Override or keep from job]", minimum=10, maximum=200, step=1, value=30, interactive=True)
                         
-                    det_files = gr.File(label="All Files (Download)", file_count="multiple", interactive=False, elem_id="det_files_list")
+                        gr.Markdown("### Video Generation" + ("" if has_gsplat else " *(gsplat (CUDA/MPS) required)*"))
+                        det_vid_seconds = gr.Slider(label="Video Duration (s)", minimum=1, maximum=6, value=2, step=1, interactive=has_gsplat)
+                        
+                        gr.Markdown("**Trajectories:**")
+                        det_traj_controls = {}
+                        with gr.Row():
+                            det_traj_rf = gr.Checkbox(label="Rotate Forward", value=True, interactive=has_gsplat, scale=3)
+                            det_traj_rf_d = gr.Checkbox(label="Depth", value=False, interactive=has_gsplat, scale=1)  # Interactive since RF is on by default
+                            det_traj_controls["rotate_forward"] = (det_traj_rf, det_traj_rf_d)
+                        with gr.Row():
+                            det_traj_r = gr.Checkbox(label="Full Rotate", value=False, interactive=has_gsplat, scale=3)
+                            det_traj_r_d = gr.Checkbox(label="Depth", value=False, interactive=False, scale=1)
+                            det_traj_controls["rotate"] = (det_traj_r, det_traj_r_d)
+                        with gr.Row():
+                            det_traj_s = gr.Checkbox(label="Swipe", value=False, interactive=has_gsplat, scale=3)
+                            det_traj_s_d = gr.Checkbox(label="Depth", value=False, interactive=False, scale=1)
+                            det_traj_controls["swipe"] = (det_traj_s, det_traj_s_d)
+                        with gr.Row():
+                            det_traj_sh = gr.Checkbox(label="Shake", value=False, interactive=has_gsplat, scale=3)
+                            det_traj_sh_d = gr.Checkbox(label="Depth", value=False, interactive=False, scale=1)
+                            det_traj_controls["shake"] = (det_traj_sh, det_traj_sh_d)
+
+                        # New Trajectories Row 1
+                        with gr.Row():
+                            det_traj_di = gr.Checkbox(label="Dolly In", value=False, interactive=has_gsplat, scale=3)
+                            det_traj_di_d = gr.Checkbox(label="Depth", value=False, interactive=False, scale=1)
+                            det_traj_controls["dolly_in"] = (det_traj_di, det_traj_di_d)
+                        with gr.Row():
+                            det_traj_do = gr.Checkbox(label="Dolly Out", value=False, interactive=has_gsplat, scale=3)
+                            det_traj_do_d = gr.Checkbox(label="Depth", value=False, interactive=False, scale=1)
+                            det_traj_controls["dolly_out"] = (det_traj_do, det_traj_do_d)
+                        with gr.Row():
+                            det_traj_dio = gr.Checkbox(label="Dolly In-Out", value=False, interactive=has_gsplat, scale=3)
+                            det_traj_dio_d = gr.Checkbox(label="Depth", value=False, interactive=False, scale=1)
+                            det_traj_controls["dolly_in_out"] = (det_traj_dio, det_traj_dio_d)
+
+                        # New Trajectories Row 2
+                        with gr.Row():
+                            det_traj_pl = gr.Checkbox(label="Pan Left", value=False, interactive=has_gsplat, scale=3)
+                            det_traj_pl_d = gr.Checkbox(label="Depth", value=False, interactive=False, scale=1)
+                            det_traj_controls["pan_left"] = (det_traj_pl, det_traj_pl_d)
+                        with gr.Row():
+                            det_traj_pr = gr.Checkbox(label="Pan Right", value=False, interactive=has_gsplat, scale=3)
+                            det_traj_pr_d = gr.Checkbox(label="Depth", value=False, interactive=False, scale=1)
+                            det_traj_controls["pan_right"] = (det_traj_pr, det_traj_pr_d)
+                        with gr.Row():
+                            det_traj_plr = gr.Checkbox(label="Pan L-R", value=False, interactive=has_gsplat, scale=3)
+                            det_traj_plr_d = gr.Checkbox(label="Depth", value=False, interactive=False, scale=1)
+                            det_traj_controls["pan_left_right"] = (det_traj_plr, det_traj_plr_d)
+                        
+                        with gr.Row():
+                            btn_gen_ply = gr.Button("⚙️ Regenerate 3DGS PLY", variant="primary", interactive=False)
+                            btn_gen_video = gr.Button("🎥 Generate Videos", variant="secondary", interactive=False)
                     
-                    with gr.Row():
-                        btn_delete_job = gr.Button("🗑️ Delete Job", variant="stop", elem_id="btn_delete_job_details", interactive=False)
+                    # Files & Actions Accordion
+                    with gr.Accordion("📁 Files & Actions", open=True):
+                        with gr.Row():
+                            btn_make_zip = gr.Button("📦 Create ZIP", variant="secondary", interactive=False, scale=1)
+                            btn_delete_job = gr.Button("🗑️ Delete Job", variant="stop", elem_id="btn_delete_job_details", interactive=False, scale=1)
+                        
+                        zip_output = gr.File(label="Download ZIP", interactive=False, visible=False)
+                        det_files = gr.File(label="All Files", file_count="multiple", interactive=False, elem_id="det_files_list")
                     
-                    det_log = gr.Textbox(label="Operation Status", lines=1)
+                    # Operation Log
+                    det_log = gr.Textbox(label="Operation Log", lines=8, max_lines=15, autoscroll=True, elem_id="det_job_log")
 
         # --- TAB 3: LICENSES & CREDITS ---
         with gr.Tab("Licenses & Credits"):
             gr.Markdown("### Credits & Documentation")
             
-            def get_repo_file_content(filename):
-                # The repo is cloned into app/ml-sharp, which is BASE_DIR/ml-sharp
-                target_path = os.path.join(BASE_DIR, "ml-sharp", filename)
+            def get_fs_file_content(path_parts):
+                target_path = os.path.join(BASE_DIR, *path_parts)
                 if os.path.exists(target_path):
                     try:
                         with open(target_path, "r", encoding="utf-8") as f:
                             return f.read()
                     except Exception as e:
-                        return f"Error reading {filename}: {e}"
-                return f"File '{filename}' not found. It should be available after the full installation process."
+                        return f"Error reading file: {e}"
+                return "File not found."
 
-            with gr.Accordion("ML-Sharp Guide (README)", open=True):
-                gr.Markdown(get_repo_file_content("README.md"))
+            with gr.Accordion("WebUI for ML-Sharp License", open=False):
+                gr.Code(value=get_fs_file_content(["..", "LICENSE"]), language="markdown", interactive=False)
 
-            with gr.Accordion("Software License (LICENSE)", open=False):
-                gr.Code(value=get_repo_file_content("LICENSE"), language="markdown", interactive=False)
+            with gr.Accordion("ML-Sharp Guide (README)", open=False):
+                gr.Markdown(get_fs_file_content(["ml-sharp", "README.md"]))
+
+
+
+            with gr.Accordion("Third-Party Credits (gsplat MPS-Lite)", open=False):
+                gr.Markdown(get_fs_file_content(["THIRD_PARTY_NOTICES.md"]))
+
+            with gr.Accordion("Software License (ML-Sharp)", open=False):
+                gr.Code(value=get_fs_file_content(["ml-sharp", "LICENSE"]), language="markdown", interactive=False)
             
-            with gr.Accordion("Model License (LICENSE_MODEL)", open=False):
-                gr.Code(value=get_repo_file_content("LICENSE_MODEL"), language="markdown", interactive=False)
+            with gr.Accordion("Model License (ML-Sharp)", open=False):
+                gr.Code(value=get_fs_file_content(["ml-sharp", "LICENSE_MODEL"]), language="markdown", interactive=False)
                 
+            with gr.Accordion("gsplat License (Apache 2.0)", open=False):
+                gr.Code(value=get_fs_file_content(["licenses", "gsplat_LICENSE"]), language="markdown", interactive=False)
+
             with gr.Accordion("Acknowledgements & Credits", open=False):
-                gr.Markdown(get_repo_file_content("ACKNOWLEDGEMENTS"))
+                gr.Markdown(get_fs_file_content(["ml-sharp", "ACKNOWLEDGEMENTS"]))
 
         # --- TAB 4: APP GUIDE ---
         with gr.Tab("App Guide"):
@@ -928,18 +1477,78 @@ with gr.Blocks(title="WebUI for ML-Sharp (3DGS)", delete_cache=(86400, 86400)) a
     refresh_outputs = [
         selected_job_lbl, 
         det_img, 
-        det_model_3d,  # NEW: 3D Viewer
+        det_model_3d,
+        drp_det_vid_selector,
         det_files, 
         det_vid_c, 
         det_vid_d, 
         det_log, 
-        zip_output,     
-        btn_gen_ply, 
+        zip_output,
+        btn_gen_ply,
         btn_gen_video,
-        btn_make_zip,   # Index 10
-        btn_delete_job, # Index 11
-        btn_run         # Index 12
+        btn_make_zip,
+        btn_delete_job,
+        btn_run
     ]
+
+    # 4. Video Selector Events
+    def on_trajectory_change(job_name, trajectory):
+        print(f"[DEBUG] on_trajectory_change: job='{job_name}', traj='{trajectory}'")
+        if not job_name or not trajectory:
+             return gr.update(value=None), gr.update(value=None)
+        
+        job_dir = os.path.join(OUTPUTS_DIR, job_name)
+        
+        # Try new format first: input_source_{trajectory}.mp4
+        color = os.path.join(job_dir, f"input_source_{trajectory}.mp4")
+        depth = os.path.join(job_dir, f"input_source_{trajectory}.depth.mp4")
+        
+        # Fallback for old formats
+        if not os.path.exists(color):
+            # Try legacy: input_video.mp4
+            legacy_color = os.path.join(job_dir, "input_video.mp4")
+            if os.path.exists(legacy_color):
+                color = legacy_color
+                depth = os.path.join(job_dir, "input_video.depth.mp4")
+            else:
+                # Try any mp4 that's not depth
+                all_mp4 = glob.glob(os.path.join(job_dir, "*.mp4"))
+                for f in all_mp4:
+                    fname = os.path.basename(f).lower()
+                    if "depth" not in fname:
+                        color = f
+                        # Look for matching depth
+                        depth_cand = f.replace(".mp4", ".depth.mp4")
+                        if os.path.exists(depth_cand):
+                            depth = depth_cand
+                        break
+        
+        if not os.path.exists(color) if color else True: 
+            print(f"[DEBUG] Color video not found")
+            color = None
+        if not os.path.exists(depth) if depth else True: 
+            print(f"[DEBUG] Depth video not found")
+            depth = None
+            
+        return color, depth
+
+    drp_new_vid_selector.change(
+        fn=on_trajectory_change,
+        inputs=[current_job_state, drp_new_vid_selector],
+        outputs=[new_vid_c, new_vid_d]
+    )
+    drp_det_vid_selector.change(
+        fn=on_trajectory_change,
+        inputs=[current_job_state, drp_det_vid_selector],
+        outputs=[det_vid_c, det_vid_d]
+    )
+
+    # History tab trajectory depth toggle (same logic as New Job)
+    def det_update_depth_box(traj_enabled):
+        return gr.update(interactive=traj_enabled, value=False if not traj_enabled else gr.skip())
+    
+    for key, (tc, td) in det_traj_controls.items():
+        tc.change(fn=det_update_depth_box, inputs=[tc], outputs=[td])
 
     # 3. Job Selection
     # The output list must match load_job_details_by_name returns (11 items) + state = 12
@@ -959,11 +1568,18 @@ with gr.Blocks(title="WebUI for ML-Sharp (3DGS)", delete_cache=(86400, 86400)) a
     )
     
     # 4. Job Execution - GENERATOR with Global Lock
-    def predict_and_refresh(image_path, do_render_video, current_job_name):
+    def predict_and_refresh(image_path, do_render_video, low_vram, seconds, f_mm, current_job_name, *traj_args):
+        # traj_args is [rf_c, rf_d, r_c, r_d, s_c, s_d, sh_c, sh_d]
         if is_system_busy():
-            # Error yield: Update log, keep everything else same
-            yield ("⚠️ SYSTEM BUSY", gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip())
+            yield ("⚠️ SYSTEM BUSY", gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip())
             return
+        
+        keys = ["rotate_forward", "rotate", "swipe", "shake", "dolly_in", "dolly_out", "dolly_in_out", "pan_left", "pan_right", "pan_left_right"]
+        traj_config = {}
+        for i, key in enumerate(keys):
+            traj_config[key] = {"enabled": traj_args[i*2], "depth": traj_args[i*2+1]}
+        
+        num_steps = seconds * 30
             
         # Set Lock
         new_job_task = "Training New Job..."
@@ -971,118 +1587,210 @@ with gr.Blocks(title="WebUI for ML-Sharp (3DGS)", delete_cache=(86400, 86400)) a
         running_tasks[task_key] = new_job_task
         
         try:
-             # Yield 1: BUSY STATE
-             # Outputs: [new_log, new_model_3d, hist_list_html, new_vid_c, new_vid_d, new_result_files, btn_run, btn_make_zip, btn_gen_ply, btn_gen_video]
+             # Initial Yield: BUSY STATE
+             # [new_log, new_model_3d, selector, new_vid_c, new_vid_d, new_result_files, hist_list, job_state, btn_run, btn_make_zip, btn_gen_ply, btn_gen_video]
              yield (
-                 "Starting training... (System Locked)", 
+                 "[Training] Starting training... (System Locked)", 
                  gr.skip(),  # new_model_3d
-                 gr.skip(), gr.skip(), gr.skip(), gr.skip(), # html, vids, files 
+                 gr.skip(),  # selector
+                 gr.skip(), gr.skip(), gr.skip(), # vids, files
+                 gr.skip(), # hist_list
+                 gr.skip(), # job_state
                  gr.update(interactive=False), # btn_run
                  gr.update(interactive=False), # btn_make_zip
                  gr.update(interactive=False), # btn_gen_ply
                  gr.update(interactive=False)  # btn_gen_video
              )
              
-             result = predict(image_path, do_render_video)
-             log_msg = result[0]
-             vid_c = result[2] if len(result) > 2 else None
-             vid_d = result[3] if len(result) > 3 else None
-             job_dir = result[4] if len(result) > 4 else None
+             # Consume Generator with throttling
+             last_log_yield = 0
+             log_update_interval = 0.5  # seconds
+             current_log_cache = ""
+             available_trajs = []
+             last_vc = None  # Track last video paths
+             last_vd = None
              
-             # Find PLY for 3D viewer
-             ply_file = None
-             files_found = []
-             if job_dir and os.path.exists(job_dir):
-                  raw_files = glob.glob(os.path.join(job_dir, "*.*"))
-                  for f in raw_files:
-                      # Skip converted files for file list
-                      if "_gradio" in f.lower():
-                          continue
-                      if f.lower().endswith('.ply'):
-                          ply_file = f
-                      if f.lower().endswith(('.ply', '.mp4')):
-                          files_found.append(f)
-             
-             # Convert PLY for Gradio viewer
-             if ply_file:
-                  ply_file = convert_ply_for_gradio(ply_file)
-             
-             new_html = generate_job_list_html()
-             
-             # Unset lock
-             if task_key in running_tasks: del running_tasks[task_key]
-             
-             # Restore Right Panel State
-             right_state = load_job_details_by_name(current_job_name)
-             
-             # Indices updated: 0=lbl, 1=img, 2=model3d, 3=files, 4=vc, 5=vd, 6=log, 7=zip, 8=ply_btn, 9=vid_btn, 10=zip_btn, 11=del_btn, 12=run_btn
-             ply_upd = right_state[8]
-             vid_upd = right_state[9]
-             zip_upd = right_state[10]
-             del_upd = right_state[11]
-             run_upd = right_state[12]
-             
-             # Yield 2: Completed State
-             # Outputs: [new_log, new_model_3d, hist_list_html, new_vid_c, new_vid_d, new_result_files, btn_run, btn_make_zip, btn_gen_ply, btn_gen_video]
-             yield (
-                 log_msg, 
-                 ply_file,        # new_model_3d
-                 new_html, 
-                 vid_c, 
-                 vid_d, 
-                 files_found,     # new_result_files
-                 run_upd,         # btn_run
-                 zip_upd,         # btn_make_zip
-                 ply_upd,         # btn_gen_ply
-                 vid_upd          # btn_gen_video
-             )
-             
+             for status, payload in predict(image_path, do_render_video, traj_config=traj_config, num_steps=num_steps, low_vram=low_vram, f_mm=f_mm):
+                 if status == "log":
+                     current_log_cache = payload
+                     now = time.time()
+                     # Only yield log updates every log_update_interval seconds
+                     if now - last_log_yield >= log_update_interval:
+                         last_log_yield = now
+                         # Use last known video paths to prevent flickering
+                         vid_c_val = last_vc if last_vc else gr.skip()
+                         vid_d_val = last_vd if last_vd else gr.skip()
+                         yield (
+                             "[Training] " + current_log_cache, 
+                             gr.skip(), gr.skip(), vid_c_val, vid_d_val, gr.skip(), gr.skip(), gr.skip(), 
+                             gr.skip(), gr.skip(), gr.skip(), gr.skip()
+                         )
+                 
+                 elif status == "ply_ready":
+                     ply_path, _, _ = payload
+                     ply_view = convert_ply_for_gradio(ply_path)
+                     yield (
+                         "[50%] PLY Generated! Rendering videos...\n" + current_log_cache,
+                         ply_view,
+                         gr.skip(), gr.skip(), gr.skip(),
+                         [ply_path],
+                         gr.skip(), gr.skip(),
+                         gr.skip(), gr.skip(), gr.skip(), gr.skip()
+                     )
+                     
+
+                     
+                 elif status == "video_ready":
+                     traj, vc, vd = payload
+                     # Update video selector with new trajectory
+                     available_trajs.append(traj)
+                     
+                     # Track last video paths to prevent flickering
+                     last_vc = vc
+                     last_vd = vd
+                     
+                     # Persist the message so it doesn't disappear on next log update
+                     done_msg = f"Rendered {traj}!"
+                     current_log_cache = done_msg + "\n" + current_log_cache
+                     
+                     print(f"DEBUG: Yielding video update for {traj}: C={vc}, D={vd}")
+                     yield (
+                         "[Training] " + current_log_cache,
+                         gr.skip(), 
+                         gr.update(choices=available_trajs, value=traj), # Update selector and select newest
+                         vc,  # Pass path directly like regen_video_action
+                         vd,  # Pass path directly 
+                         gr.skip(), # file list
+                         gr.skip(), gr.skip(), 
+                         gr.skip(), gr.skip(), gr.skip(), gr.skip()
+                     )
+                     # Brief pause to ensure frontend receives and processes the video update 
+                     # before the next log update comes rushing in.
+                     time.sleep(0.2)
+                     
+                 elif status == "rendering":
+                     traj, depth = payload
+                     # Use last known video paths to prevent flickering
+                     vid_c_val = last_vc if last_vc else gr.skip()
+                     vid_d_val = last_vd if last_vd else gr.skip()
+                     yield (
+                         f"[Training] [70%] Rendering {traj}...\n" + current_log_cache,
+                         gr.skip(), gr.skip(), vid_c_val, vid_d_val, gr.skip(), gr.skip(), gr.skip(), 
+                         gr.skip(), gr.skip(), gr.skip(), gr.skip()
+                     )
+                     
+                 elif status == "done":
+                     final_log, result_data = payload
+                     msg, _, vid_c, vid_d, job_dir = result_data
+                     
+                     # Process Results similar to before
+                     ply_file = None
+                     files_found = []
+                     if job_dir and os.path.exists(job_dir):
+                          raw_files = glob.glob(os.path.join(job_dir, "*.*"))
+                          for f in raw_files:
+                              if "_gradio" in f.lower(): continue
+                              if f.lower().endswith('.ply'): ply_file = f
+                              if f.lower().endswith(('.ply', '.mp4')): files_found.append(f)
+                     
+                     if ply_file: ply_file = convert_ply_for_gradio(ply_file)
+                     
+                     selector_choices = []
+                     if job_dir:
+                          meta = load_metadata(job_dir)
+                          selector_choices = meta.get("rendered_trajectories", [])
+                     
+                     # Final Yield: Enable all
+                     yield (
+                         final_log + "\n" + msg,
+                         ply_file,
+                         gr.update(choices=selector_choices, value=selector_choices[-1] if selector_choices else None),
+                         vid_c,
+                         vid_d,
+                         files_found,
+                         generate_job_list_html(),
+                         os.path.basename(job_dir) if job_dir else gr.skip(),
+                         gr.update(interactive=True), # btn_run
+                         gr.update(interactive=True) if job_dir else gr.skip(), 
+                         gr.update(interactive=True) if job_dir else gr.skip(), 
+                         gr.update(interactive=True) if (job_dir and check_cuda()) else gr.skip()
+                     )
+                 elif status == "error":
+                     yield (
+                         payload, gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), 
+                         gr.update(interactive=True), gr.update(interactive=True), gr.update(interactive=True), gr.update(interactive=True)
+                     )
+
         except Exception as e:
-            if task_key in running_tasks: del running_tasks[task_key]
-            yield (f"Error: {e}", gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.update(interactive=True), gr.update(interactive=True), gr.update(interactive=True), gr.update(interactive=True))
+            import traceback
+            traceback.print_exc()
+            yield (f"Error: {e}", gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.update(interactive=True), gr.skip(), gr.skip(), gr.skip())
+
+        finally:
+             if task_key in running_tasks: del running_tasks[task_key]
 
     # 4. Buttons
     btn_run.click(
         predict_and_refresh, 
-        inputs=[new_input, chk_render, current_job_state], 
+        inputs=[new_input, chk_render, chk_low_vram, sl_seconds, sl_focal, current_job_state] + all_traj_inputs, 
         outputs=[
              new_log, 
-             new_model_3d, # NEW: 3D Viewer
-             hist_list_html, 
+             new_model_3d,
+             drp_new_vid_selector,
              new_vid_c, 
              new_vid_d,
              new_result_files, 
-             btn_run,      # Self
-             btn_make_zip, # Right side
-             btn_gen_ply,  # Right side
-             btn_gen_video # Right side
-        ]
+             hist_list_html,
+             current_job_state, # Update state after job
+             btn_run,
+             btn_make_zip, 
+             btn_gen_ply, 
+             btn_gen_video
+        ],
+        show_progress="hidden"
     )
     
     # ZIP Generation
     btn_make_zip.click(
         fn=zip_job,
         inputs=[current_job_state],
-        outputs=refresh_outputs
+        outputs=refresh_outputs,
+        show_progress="hidden"
     )
     
     btn_gen_ply.click(
         fn=retry_job_ply,
-        inputs=[current_job_state],
-        outputs=refresh_outputs
+        inputs=[current_job_state, det_low_vram],
+        outputs=refresh_outputs,
+        show_progress="hidden"
     )
+    
+    # History tab trajectory inputs - ALL 10 trajectories
+    det_traj_inputs = [
+        det_traj_rf, det_traj_rf_d,     # rotate_forward
+        det_traj_r, det_traj_r_d,       # rotate
+        det_traj_s, det_traj_s_d,       # swipe
+        det_traj_sh, det_traj_sh_d,     # shake
+        det_traj_di, det_traj_di_d,     # dolly_in
+        det_traj_do, det_traj_do_d,     # dolly_out
+        det_traj_dio, det_traj_dio_d,   # dolly_in_out
+        det_traj_pl, det_traj_pl_d,     # pan_left
+        det_traj_pr, det_traj_pr_d,     # pan_right
+        det_traj_plr, det_traj_plr_d    # pan_left_right
+    ]
     
     btn_gen_video.click(
         fn=regen_video_action,
-        inputs=[current_job_state],
-        outputs=refresh_outputs
+        inputs=[current_job_state, det_low_vram, det_vid_seconds] + det_traj_inputs,
+        outputs=refresh_outputs,
+        show_progress="hidden"
     )
     
     # 6. Delete functionality
     def delete_job_action(job_name):
         if not job_name:
              # Return updates preserving current UI but clearing state if needed
-             return (gr.update(),) * 13 + ("",)
+             return (gr.update(),) * 14 + ("",)
             
         job_dir = os.path.join(OUTPUTS_DIR, job_name)
         if os.path.exists(job_dir):
@@ -1099,11 +1807,11 @@ with gr.Blocks(title="WebUI for ML-Sharp (3DGS)", delete_cache=(86400, 86400)) a
         
         # Get default "empty" state for right panel
         default_state = list(load_job_details_by_name(""))
-        # Index 5 is status_text/log
-        default_state[5] = msg
+        # Index 7 is status_text/log
+        default_state[7] = msg
         
-        # Return new_html + default_state (12 items) + empty state string
-        # Match order: hist_list_html (1) + load_job_details_by_name (12) + current_job_state (1) = 14 items
+        # Return new_html + default_state (14 items) + empty state string
+        # Match order: hist_list_html (1) + load_job_details_by_name (14) + current_job_state (1) = 16 items
         return (new_html,) + tuple(default_state) + ("",)
 
     btn_delete_job.click(
@@ -1128,7 +1836,7 @@ with gr.Blocks(title="WebUI for ML-Sharp (3DGS)", delete_cache=(86400, 86400)) a
         # helper for return
         def return_refresh(log_msg=""):
             res = list(load_job_details_by_name(job_name))
-            if log_msg: res[5] = log_msg
+            if log_msg: res[7] = log_msg
             return tuple(res)
             
         if not job_name or not file_name_raw:

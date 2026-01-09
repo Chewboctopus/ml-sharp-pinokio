@@ -210,31 +210,42 @@ setInterval(() => {
         const fileList = document.getElementById(id);
         if (!fileList) return;
 
-        const removeBtns = fileList.querySelectorAll('button[aria-label="Remove this file"], button.label-clear-button');
+        // Select ALL buttons and check labels/titles
+        const allButtons = fileList.querySelectorAll('button');
 
-        removeBtns.forEach(btn => {
-            const row = btn.closest('tr') || btn.closest('.file-preview-item');
-            if (row) {
-                const text = (row.innerText || row.textContent).toLowerCase();
-                const isImage = text.includes('.png') || text.includes('.jpg') || text.includes('.jpeg') || text.includes('.webp');
+        allButtons.forEach(btn => {
+            const label = (btn.getAttribute('aria-label') || btn.getAttribute('title') || '').toLowerCase();
+            const text = (btn.innerText || btn.textContent || '').trim().toLowerCase();
 
-                // Logic: Hide if it's the New Job list (all files) OR if it's an image in the Detail list
-                const shouldHide = (id === 'new_result_files_list') || isImage;
+            const isRemoveBtn = label.includes('remove') || label.includes('clear') || label.includes('delete') ||
+                text === '✕' || text === 'x' || btn.classList.contains('label-clear-button');
 
-                if (shouldHide) {
-                    // HIDE but keep layout space (Alignment Fix)
-                    if (btn.style.visibility !== 'hidden') {
-                        btn.style.visibility = 'hidden';
-                        btn.style.opacity = '0';
-                        btn.style.pointerEvents = 'none';
-                        btn.style.display = '';
-                    }
-                } else {
-                    // Ensure visible
-                    if (btn.style.visibility === 'hidden') {
-                        btn.style.visibility = 'visible';
-                        btn.style.opacity = '1';
-                        btn.style.pointerEvents = '';
+            if (isRemoveBtn) {
+                const row = btn.closest('tr') || btn.closest('.file-preview-item');
+                if (row) {
+                    const rowText = (row.innerText || row.textContent).toLowerCase();
+                    const isImage = rowText.includes('.png') || rowText.includes('.jpg') || rowText.includes('.jpeg') || rowText.includes('.webp');
+
+                    // Hide if it's the New Job list (all files) OR if it's an image in the Detail list
+                    const shouldHide = (id === 'new_result_files_list') || isImage;
+
+                    if (shouldHide) {
+                        if (btn.style.visibility !== 'hidden') {
+                            btn.style.visibility = 'hidden';
+                            btn.style.opacity = '0';
+                            btn.style.pointerEvents = 'none';
+                            btn.style.display = ''; // Keep for layout
+                        }
+                    } else {
+                        // Keep visible for other files in History (like PLYs/MP4s if user wants to delete? 
+                        // Actually user said "hide unnecessary file deletion buttons". 
+                        // If they have a separate "Delete Job" button, maybe they want them all hidden?
+                        // Let's stick to hiding everything in New Job and images in History.
+                        if (btn.style.visibility === 'hidden') {
+                            btn.style.visibility = 'visible';
+                            btn.style.opacity = '1';
+                            btn.style.pointerEvents = '';
+                        }
                     }
                 }
             }
@@ -256,3 +267,243 @@ document.addEventListener('click', (e) => {
 document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') checkAndResetLibrary();
 });
+
+// Processing Animation Toggle with Timer
+// Monitors components and shows pulsing animation + execution timer
+(function () {
+    let processingActive = false;
+    let timerStartTime = null;
+    let timerElement = null;
+    let timerInterval = null;
+    let currentContext = null; // 'new_job' or 'history'
+
+    // Component tracking: which are waiting vs ready
+    const componentState = {
+        ply: false,    // true when PLY is loaded
+        videos: false  // true when videos are loaded
+    };
+
+    function createTimerElement() {
+        if (!timerElement) {
+            timerElement = document.createElement('div');
+            timerElement.id = 'execution-timer';
+            timerElement.textContent = '00:00';
+            document.body.appendChild(timerElement);
+        }
+        return timerElement;
+    }
+
+    function formatTime(seconds) {
+        const mins = Math.floor(seconds / 60);
+        const secs = Math.floor(seconds % 60);
+        return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+    }
+
+    function startTimer() {
+        timerStartTime = Date.now();
+        const timer = createTimerElement();
+        timer.classList.add('active');
+
+        if (timerInterval) clearInterval(timerInterval);
+        timerInterval = setInterval(() => {
+            const elapsed = (Date.now() - timerStartTime) / 1000;
+            timer.textContent = formatTime(elapsed);
+        }, 100);
+    }
+
+    function stopTimer() {
+        if (timerInterval) {
+            clearInterval(timerInterval);
+            timerInterval = null;
+        }
+        if (timerElement) {
+            timerElement.classList.remove('active');
+        }
+    }
+
+    function setComponentWaiting(elementId, waiting) {
+        const el = document.getElementById(elementId);
+        if (el) {
+            if (waiting) {
+                el.classList.add('waiting-component');
+            } else {
+                el.classList.remove('waiting-component');
+            }
+        }
+    }
+
+    function getLogText(containerId) {
+        const container = document.getElementById(containerId);
+        if (!container) return '';
+        const textarea = container.querySelector('textarea');
+        return textarea ? textarea.value : '';
+    }
+
+    function checkProcessingState() {
+        // Check New Job tab
+        const newJobLog = getLogText('new_job_log');
+        const detJobLog = getLogText('det_job_log');
+
+        // Determine which context is active
+        const newJobProcessing = newJobLog.includes('[Training]') || newJobLog.includes('[50%]') || newJobLog.includes('[70%]');
+
+        // History tab: distinguish between PLY generation and video rendering
+        const detPlyProcessing = detJobLog.includes('[Generating]');
+        const detVideoProcessing = detJobLog.includes('[Rendering]');
+        const detJobProcessing = detPlyProcessing || detVideoProcessing;
+
+        const newJobCompleted = newJobLog.includes('Completed:') || newJobLog.includes('Error:');
+        // Simple detection: look for [Done] marker (added at end of all operations)
+        const detJobCompleted = detJobLog.includes('[Done]');
+
+        // Debug: log when [Done] is detected
+        if (detJobCompleted && processingActive) {
+            console.log('[Animation] Detected [Done] marker, stopping animation');
+        }
+
+        // New Job context
+        if (newJobProcessing && !newJobCompleted && !processingActive) {
+            processingActive = true;
+            currentContext = 'new_job';
+            componentState.ply = false;
+            componentState.videos = false;
+            startTimer();
+
+            const logContainer = document.getElementById('new_job_log');
+            const btnRun = document.getElementById('btn_start_gen');
+            if (logContainer) logContainer.classList.add('processing-active');
+            if (btnRun) {
+                const btn = btnRun.querySelector('button') || btnRun;
+                btn.classList.add('btn-processing');
+            }
+
+            setComponentWaiting('new_model_3d', true);
+            setComponentWaiting('new_vid_color', true);
+            setComponentWaiting('new_vid_depth', true);
+        }
+
+        // History tab context - PLY generation
+        if (detPlyProcessing && !detVideoProcessing && !detJobCompleted && !processingActive) {
+            processingActive = true;
+            currentContext = 'history_ply';
+            componentState.ply = false;
+            startTimer();
+
+            const logContainer = document.getElementById('det_job_log');
+            if (logContainer) logContainer.classList.add('processing-active');
+
+            // Only illuminate 3D viewer for PLY generation
+            setComponentWaiting('det_model_3d', true);
+        }
+
+        // History tab context - Video rendering
+        if (detVideoProcessing && !detJobCompleted && !processingActive) {
+            processingActive = true;
+            currentContext = 'history_video';
+            componentState.videos = false;
+            startTimer();
+
+            const logContainer = document.getElementById('det_job_log');
+            if (logContainer) logContainer.classList.add('processing-active');
+
+            // Only illuminate video boxes for video rendering
+            setComponentWaiting('det_vid_color', true);
+            setComponentWaiting('det_vid_depth', true);
+        }
+
+        // Handle progressive unlocking for New Job
+        if (currentContext === 'new_job' && processingActive) {
+            const plyReady = newJobLog.includes('[50%]') || newJobLog.includes('PLY Generated') || newJobLog.includes('ply_ready') || newJobLog.includes('input_source.ply');
+            const videosReady = newJobLog.includes('Completed:');
+            const videoRenderingStarted = newJobLog.includes('Engine: Rendering') || newJobLog.includes('[Rendering]');
+
+            // If PLY is ready OR video rendering has started, stop 3D viewer animation
+            if ((plyReady || videoRenderingStarted) && !componentState.ply) {
+                componentState.ply = true;
+                setComponentWaiting('new_model_3d', false);
+            }
+            if (videosReady && !componentState.videos) {
+                componentState.videos = true;
+                setComponentWaiting('new_vid_color', false);
+                setComponentWaiting('new_vid_depth', false);
+            }
+
+            if (newJobCompleted) {
+                processingActive = false;
+                currentContext = null;
+                stopTimer();
+
+                const logContainer = document.getElementById('new_job_log');
+                const btnRun = document.getElementById('btn_start_gen');
+                if (logContainer) logContainer.classList.remove('processing-active');
+                if (btnRun) {
+                    const btn = btnRun.querySelector('button') || btnRun;
+                    btn.classList.remove('btn-processing');
+                }
+                setComponentWaiting('new_model_3d', false);
+                setComponentWaiting('new_vid_color', false);
+                setComponentWaiting('new_vid_depth', false);
+            }
+        }
+
+        // Handle completion for History PLY
+        if (currentContext === 'history_ply' && processingActive && detJobCompleted) {
+            processingActive = false;
+            currentContext = null;
+            stopTimer();
+
+            const logContainer = document.getElementById('det_job_log');
+            if (logContainer) logContainer.classList.remove('processing-active');
+            setComponentWaiting('det_model_3d', false);
+        }
+
+        // Handle completion for History Video
+        if (currentContext === 'history_video' && processingActive && detJobCompleted) {
+            processingActive = false;
+            currentContext = null;
+            stopTimer();
+
+            const logContainer = document.getElementById('det_job_log');
+            if (logContainer) logContainer.classList.remove('processing-active');
+            setComponentWaiting('det_vid_color', false);
+            setComponentWaiting('det_vid_depth', false);
+        }
+
+        // Fallback: if History processing is active but no marker for 10+ seconds after log stops changing, stop
+        if ((currentContext === 'history_ply' || currentContext === 'history_video') && processingActive) {
+            if (!window._lastHistoryLogLength) window._lastHistoryLogLength = 0;
+            if (!window._historyLogStaleTime) window._historyLogStaleTime = null;
+
+            if (detJobLog.length !== window._lastHistoryLogLength) {
+                window._lastHistoryLogLength = detJobLog.length;
+                window._historyLogStaleTime = Date.now();
+            } else {
+                // Check for staleness, but ONLY if document is visible
+                // Background tabs get throttled timers, so Date.now() jumps.
+                if (document.hidden) {
+                    // Reset the clock while hidden so we don't timeout immediately on return
+                    window._historyLogStaleTime = Date.now();
+                } else if (window._historyLogStaleTime && (Date.now() - window._historyLogStaleTime > 30000)) {
+                    // Log hasn't changed for 30 seconds (and we are visible) - assume complete
+                    console.log('[Animation] Fallback: log stale for 5s, stopping animation');
+                    processingActive = false;
+                    const ctx = currentContext;
+                    currentContext = null;
+                    stopTimer();
+
+                    const logContainer = document.getElementById('det_job_log');
+                    if (logContainer) logContainer.classList.remove('processing-active');
+                    if (ctx === 'history_ply') setComponentWaiting('det_model_3d', false);
+                    if (ctx === 'history_video') {
+                        setComponentWaiting('det_vid_color', false);
+                        setComponentWaiting('det_vid_depth', false);
+                    }
+                    window._historyLogStaleTime = null;
+                }
+            }
+        }
+    }
+
+    // Check periodically
+    setInterval(checkProcessingState, 300);
+})();

@@ -1,0 +1,30 @@
+Copyright (c) 2025 Francesco Fugazzi (@franzipol) / ML-Sharp Pinokio Wrapper
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software for PERSONAL, NON-COMMERCIAL, AND RESEARCH PURPOSES ONLY,
+subject to the following conditions:
+
+1. USE RESTRICTION: This Software is a wrapper around third-party components 
+   (Apple ML-Sharp) which have strict usage limits. Therefore, this Software may 
+   ONLY be used, copied, modified, merged, published, or distributed for 
+   Personal, Non-Commercial, and/or Academic Research purposes.
+
+2. COMPATIBILITY: Use of this Software does not grant any rights to the 
+   underlying dependencies beyond what is granted by their respective licenses. 
+   Users must comply with:
+    - Apple ML-Sharp Model License (Research Use Only)
+    - Apple ML-Sharp Software License (Personal License)
+    - gsplat License (Apache 2.0)
+
+3. NOTICE: The above copyright notice, this permission notice, and the 
+   Usage Restrictions shall be included in all copies or substantial portions 
+   of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
