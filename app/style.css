@@ -12,7 +12,6 @@ h1 {
     border: 1px solid var(--border-color-primary);
     border-radius: 8px;
     background-color: var(--background-fill-primary);
-    /* Optional matches theme */
 }
 
 .job-list-item {
@@ -29,7 +28,6 @@ h1 {
     gap: 15px;
     transition: background 0.2s;
     user-select: none;
-    /* Prevent text selection */
 }
 
 .job-list-item:hover {
@@ -39,6 +37,7 @@ h1 {
 .job-list-item.selected {
     border-color: var(--color-accent);
     background: var(--background-fill-primary);
+    box-shadow: 0 0 0 2px var(--color-accent);
 }
 
 .job-list-item img {
@@ -52,7 +51,6 @@ h1 {
 .job-list-item .job-info {
     flex: 1;
     min-width: 0;
-    /* Enable text truncation in flex child */
     text-align: left;
     font-size: 13px;
     line-height: 1.4;
@@ -98,13 +96,6 @@ h1 {
 
 .job-list-item .delete-btn:hover {
     background: rgba(255, 50, 50, 1);
-}
-
-/* Selected state */
-.job-list-item.selected {
-    border-color: var(--color-accent);
-    background: var(--background-fill-primary);
-    box-shadow: 0 0 0 2px var(--color-accent);
 }
 
 /* Hide the control elements but keep them in DOM */
@@ -229,30 +220,52 @@ h1 {
 /* Processing Animation - Pulsing glow effect */
 @keyframes processing-pulse {
 
-    0%,
-    100% {
-        box-shadow: 0 0 5px var(--color-accent), 0 0 10px var(--color-accent);
-        border-color: var(--color-accent);
-    }
+    0%, 100% {
+  filter: drop-shadow(0 0 4px var(--color-accent)) drop-shadow(0 0 8px var(--color-accent));
+  border-color: var(--color-accent);
+}
 
     50% {
-        box-shadow: 0 0 15px var(--color-accent), 0 0 25px var(--color-accent);
+        filter: drop-shadow(0 0 8px var(--color-accent)) drop-shadow(0 0 16px var(--color-accent));
         border-color: var(--color-accent);
     }
+
 }
 
-/* Apply pulsing to waiting components */
-.waiting-component {
-    position: relative;
+/* Unified pulsing animation for any component (3D, Video, or Log) */
+.waiting-component,
+.processing-active{
+    position: relative !important;
     animation: processing-pulse 1.5s ease-in-out infinite !important;
     border: 2px solid var(--color-accent) !important;
-    border-radius: 8px;
+    border-radius: 8px !important;
+    box-sizing: border-box;
+    overflow: visible !important;
 }
 
-/* Log textbox specific */
-.processing-active textarea {
-    animation: processing-pulse 1.5s ease-in-out infinite !important;
-    border: 2px solid var(--color-accent) !important;
+
+/* Clean up internal Gradio elements so they don't block the container's pulse */
+.waiting-component textarea,
+.processing-active textarea,
+.waiting-component .scroll-hide,
+.processing-active .scroll-hide {
+    border: none !important;
+    background: transparent !important;
+    outline: none !important;
+}
+
+/* Force textbox containers to show glow */
+.waiting-component>div,
+.processing-active>div,
+#new_job_log.waiting-component,
+#det_job_log.waiting-component {
+    overflow: visible !important;
+}
+
+/* Ensure parent label wrapper also allows overflow */
+.waiting-component.label-wrap,
+.processing-active.label-wrap {
+    overflow: visible !important;
 }
 
 /* Spinning indicator for button */
@@ -276,6 +289,7 @@ h1 {
     border-top-color: currentColor;
     border-radius: 50%;
     animation: spin 0.8s linear infinite;
+    vertical-align: middle;
 }
 
 /* Execution Timer Display */
@@ -301,4 +315,97 @@ h1 {
 
 #execution-timer::before {
     content: "⏱️ ";
+}
+
+/* --- ADVANCED UI LOCKING & DIMMING --- */
+
+/* 
+   We apply opacity and remove pointer events for styles, but we MUST keep
+   basic pointer interactivity (pointer-events: auto implies we can hover)
+   so we can show the not-allowed cursor.
+   BUT, we used JS to block clicks.
+*/
+
+body.ui-locked .tab-nav,
+body.ui-locked #main_tabs>.tab-nav,
+body.ui-locked .tab-nav button,
+body.ui-locked .job-list-container,
+body.ui-locked #btn_start_gen:not(.btn-processing),
+body.ui-locked #btn_gen_ply:not(.btn-processing),
+body.ui-locked #btn_gen_video:not(.btn-processing),
+body.ui-locked #btn_delete_job_details:not(.btn-processing),
+body.ui-locked button:not([id*="btn_stop_gen"]):not([id*="btn_start_gen"]):not([id*="btn_gen_ply"]):not([id*="btn_gen_video"]) { 
+    opacity: 0.5 !important;
+    filter: grayscale(0.8) !important;
+    transition: all 0.3s ease;
+}
+
+body.ui-locked .tab-nav button,
+body.ui-locked #main_tabs button[role="tab"] {
+    cursor: not-allowed !important;
+}
+
+/* Apply not-allowed ONLY to logical blocks that should be locked */
+body.ui-locked .tab-nav button,
+body.ui-locked #btn_start_gen,
+body.ui-locked #btn_gen_ply,
+body.ui-locked #btn_gen_video,
+body.ui-locked #btn_delete_job_details,
+body.ui-locked .job-list-item {
+    cursor: not-allowed !important;
+}
+
+/* Ensure other components keep default/text cursor so users can still scroll/copy log */
+body.ui-locked .gradio-container input,
+body.ui-locked .gradio-container textarea,
+body.ui-locked .gradio-container .prose,
+body.ui-locked .gradio-container .file-preview {
+    cursor: auto !important;
+}
+
+/* Specific styling for STOP buttons when UI is locked (making them stand out as the only exit) */
+button[id*="btn_stop_gen"] {
+    min-width: 50px !important;
+    max-width: 60px !important;
+    height: 100% !important;
+    min-height: 48px !important; /* Standard Gradio Large Button Height */
+    padding: 0 !important;
+    font-size: 24px !important;
+    border: none !important;
+    border-radius: 9999px !important; /* Force pill shape like Start button */
+}
+
+/* Harmonize all primary action buttons to match Stop button height and pill shape */
+#btn_start_gen,
+#btn_gen_ply,
+#btn_gen_video,
+#btn_delete_job_details,
+#btn_zip_det {
+    min-height: 48px !important;
+    border-radius: 9999px !important;
+}
+
+body.ui-locked button[id*="btn_stop_gen"] {
+    opacity: 1 !important;
+    filter: none !important;
+    cursor: pointer !important;
+    background-color: #ff4d4d !important; /* Brighter red */
+}
+
+body.ui-locked button[id*="btn_stop_gen"]:hover {
+    background-color: #ff0000 !important;
+}
+
+/* Anti-clipping super aggressivo per i log */
+#new_job_log,
+#det_job_log,
+#new_job_log *,
+#det_job_log * {
+    overflow: visible !important;
+}
+
+/* Fixed height for training image box - restricted to main container */
+#new_job_image {
+    height: 400px !important;
+    min-height: 400px !important;
 }

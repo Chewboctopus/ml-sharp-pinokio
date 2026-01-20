@@ -1,7 +1,7 @@
 const path = require('path')
 
 module.exports = {
-  version: "2.0",
+  version: "0.3",
   title: "WebUI for ML-Sharp (3DGS)",
   description: "One-click 3D Gaussian Splatting generation from a single image.",
   icon: "icon.png",

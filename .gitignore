@@ -18,6 +18,8 @@ app/outputs/
 app/temp_proc/
 app/env/
 app/ml-sharp/
+app/env/
+*.json
 
 # Standard Python
 __pycache__/
