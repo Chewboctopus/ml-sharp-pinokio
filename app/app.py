@@ -505,6 +505,17 @@ class QueuedLoggingHandler(logging.Handler):
     def emit(self, record):
         try:
             msg = self.format(record)
+            
+            # Filter out harmless Windows asyncio/proactor glitches that clutter the UI
+            # and could trigger premature animation stoppage (WinError 10054)
+            noise_markers = [
+                "ConnectionResetError: [WinError 10054]",
+                "_ProactorBasePipeTransport._call_connection_lost",
+                "handle: <Handle _ProactorBasePipeTransport._call_connection_lost"
+            ]
+            if any(marker in msg for marker in noise_markers):
+                return
+                
             self.log_queue.put(msg)
         except Exception:
             self.handleError(record)
@@ -1687,7 +1698,7 @@ with gr.Blocks(title="WebUI for ML-Sharp (3DGS)", delete_cache=(86400, 86400)) a
                             For best results, download the .ply file and edit it in 
                             <a href="https://superspl.at/editor" target="_blank" style="color: #4a90e2;">SuperSplat Editor</a>
                         </div>
-                    """)
+                    """, elem_id="supersplat_notice_new")
                     gr.Markdown("*Note: The 3D viewer FOV is fixed and may not accurately reflect the chosen focal length. Refer to rendered videos for accurate perspective.*", elem_id="fov_notice_new")
                     
                     with gr.Row():
@@ -1736,7 +1747,7 @@ with gr.Blocks(title="WebUI for ML-Sharp (3DGS)", delete_cache=(86400, 86400)) a
                                     For best results, download the .ply file and edit it in 
                                     <a href="https://superspl.at/editor" target="_blank" style="color: #4a90e2;">SuperSplat Editor</a>
                                 </div>
-                            """)
+                            """, elem_id="supersplat_notice_det")
                     
                     # Video Preview Accordion
                     with gr.Accordion("📹 Video Preview", open=True):

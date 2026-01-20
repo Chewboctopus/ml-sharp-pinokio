@@ -409,3 +409,17 @@ body.ui-locked button[id*="btn_stop_gen"]:hover {
     height: 400px !important;
     min-height: 400px !important;
 }
+
+/* Center notices and secondary text */
+#supersplat_notice_new,
+#supersplat_notice_det,
+#fov_notice_new {
+    text-align: center !important;
+    width: 100% !important;
+    display: flex !important;
+    justify-content: center !important;
+}
+
+#fov_notice_new p {
+    text-align: center !important;
+}

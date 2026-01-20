@@ -271,8 +271,10 @@ setInterval(() => {
         const isDetPlyProc = detLog.includes('[Generating]');
         const isDetVidProc = detLog.includes('[Rendering]');
 
-        const isNewJobDone = newLog.includes('Completed:') || newLog.includes('[Done]') || newLog.includes('Error:') || newLog.includes('[Cancelled]');
-        const isDetJobDone = detLog.includes('[Done]') || detLog.includes('Completed:') || detLog.includes('[Cancelled]');
+        const isNewJobDone = (newLog.includes('Completed:') || newLog.includes('[Done]') || newLog.includes('Error:') || newLog.includes('[Cancelled]')) 
+                            && !newLog.includes('[WinError 10054]');
+        const isDetJobDone = (detLog.includes('[Done]') || detLog.includes('Completed:') || detLog.includes('Error:') || detLog.includes('[Cancelled]')) 
+                            && !detLog.includes('[WinError 10054]');
 
         const activeProcess = (isNewJobProc && !isNewJobDone) || (isDetVidProc && !isDetJobDone) || (isDetPlyProc && !isDetJobDone);
 
