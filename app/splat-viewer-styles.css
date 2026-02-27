@@ -1,0 +1,50 @@
+.splat-viewer {
+    background: rgba(255, 255, 255, 0.1);
+    backdrop-filter: blur(10px);
+    border-radius: 10px;
+    padding: 20px;
+    color: #ffffff;
+}
+
+.camera-controls {
+    display: flex;
+    justify-content: center;
+    margin: 10px 0;
+}
+
+.camera-controls button {
+    background-color: rgba(0, 0, 0, 0.5);
+    border: none;
+    color: white;
+    padding: 10px 20px;
+    border-radius: 5px;
+    margin: 0 5px;
+    cursor: pointer;
+}
+
+.camera-controls button:hover {
+    background-color: rgba(0, 0, 0, 0.7);
+}
+
+.hints-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.7);
+    color: white;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 999;
+}
+
+@media screen and (max-width: 600px) {
+    .splat-viewer {
+        padding: 10px;
+    }
+    .camera-controls {
+        flex-direction: column;
+    }
+}
